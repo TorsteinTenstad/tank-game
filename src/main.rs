@@ -4,6 +4,7 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 use bevy_rapier2d::prelude::*;
+use std::iter::*;
 
 fn main() {
     App::new()
@@ -44,18 +45,24 @@ struct FadeOut {
 struct Tank {
     id: usize,
     health: i32,
+    dash_cooldown: f32,
+    turret_cooldown: f32,
     speed: f32,
     facing: Vec2,
 }
 impl Tank {
-    const DEFAULT_SPEED: f32 = 500.0;
-    const DASH_SPEED: f32 = 2000.0;
+    const DEFAULT_SPEED: f32 = 300.0;
+    const DASH_SPEED: f32 = 1500.0;
+    const DEFAULT_TURRET_COOLDOWN: f32 = 0.8;
+    const DEFAULT_DASH_COOLDOWN: f32 = 0.5;
     const SPEED_FALLOFF: f32 = (Tank::DASH_SPEED - Tank::DEFAULT_SPEED) / 0.2;
 
     fn new(id: usize) -> Self {
         Self {
             id,
             health: 3,
+            dash_cooldown: 0.0,
+            turret_cooldown: 0.0,
             speed: Tank::DEFAULT_SPEED,
             facing: Vec2::new(1.0, 0.0),
         }
@@ -102,21 +109,27 @@ fn startup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut rapier_config: ResMut<RapierConfiguration>,
+    query_window: Query<&Window>,
 ) {
     commands.spawn(Camera2dBundle::default());
+    rapier_config.gravity = Vec2::ZERO;
 
-    for id in 0..2 {
+    let window_height = query_window.get_single().unwrap().height();
+    let window_width = query_window.get_single().unwrap().width();
+
+    for (id, pos_x) in zip(0..2, vec![-150.0, 150.0]) {
         commands
             .spawn((
-                RigidBody::KinematicPositionBased,
+                RigidBody::Dynamic,
                 ActiveEvents::COLLISION_EVENTS,
-                Sensor,
+                Velocity::linear(Vec2::ZERO),
                 Collider::ball(50.0),
                 MaterialMesh2dBundle {
                     mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
                     material: materials.add(ColorMaterial::from(Color::TURQUOISE)),
                     transform: Transform::from_translation(Vec3::new(
-                        150.,
+                        pos_x,
                         0.,
                         ZOrder::Player.into(),
                     )),
@@ -140,6 +153,42 @@ fn startup(
                 });
             });
     }
+    for (pos, size) in std::iter::zip(
+        vec![
+            Vec2::new(0.0, -150.0),
+            Vec2::new(0.0, 150.0),
+            Vec2::new(-window_width / 2.0, 0.0),
+            Vec2::new(0.0, -window_height / 2.0),
+            Vec2::new(window_width / 2.0, 0.0),
+            Vec2::new(0.0, window_height / 2.0),
+        ],
+        vec![
+            Vec2::new(150.0, 150.0),
+            Vec2::new(150.0, 150.0),
+            Vec2::new(10.0, window_height),
+            Vec2::new(window_width, 10.0),
+            Vec2::new(10.0, window_height),
+            Vec2::new(window_width, 10.0),
+        ],
+    ) {
+        commands.spawn((
+            RigidBody::Fixed,
+            Collider::cuboid(size.x / 2.0, size.y / 2.0),
+            SpriteBundle {
+                sprite: Sprite {
+                    color: Color::BLACK,
+                    custom_size: Some(size),
+                    ..default()
+                },
+                transform: Transform::from_translation(Vec3::new(
+                    pos.x,
+                    pos.y,
+                    ZOrder::Player.into(),
+                )),
+                ..default()
+            },
+        ));
+    }
 }
 
 fn update(
@@ -150,26 +199,29 @@ fn update(
     gamepads: Res<Gamepads>,
     button_inputs: Res<Input<GamepadButton>>,
     axes: Res<Axis<GamepadAxis>>,
-    mut query: Query<(Entity, &mut Tank, &mut Transform)>,
+    mut query: Query<(Entity, &mut Tank, &mut Transform, &mut Velocity)>,
 ) {
-    for (entity, mut tank, mut transform) in &mut query {
+    for (entity, mut tank, mut transform, mut velocity) in &mut query {
         tank.speed = (tank.speed - Tank::SPEED_FALLOFF * time.delta_seconds())
             .clamp(Tank::DEFAULT_SPEED, Tank::DASH_SPEED);
+        tank.turret_cooldown -= time.delta_seconds();
+        tank.dash_cooldown -= time.delta_seconds();
 
         match gamepads.iter().find(|&x| x.id == tank.id) {
             Some(gamepad) => {
-                transform.translation.x += tank.speed
-                    * time.delta_seconds()
+                velocity.linvel.x = tank.speed
                     * axes
                         .get(GamepadAxis::new(gamepad, GamepadAxisType::LeftStickX))
                         .unwrap();
-                transform.translation.y += tank.speed
-                    * time.delta_seconds()
+                velocity.linvel.y = tank.speed
                     * axes
                         .get(GamepadAxis::new(gamepad, GamepadAxisType::LeftStickY))
                         .unwrap();
-                if button_inputs.just_pressed(GamepadButton::new(gamepad, GamepadButtonType::East))
+                if button_inputs
+                    .just_pressed(GamepadButton::new(gamepad, GamepadButtonType::LeftTrigger))
+                    && tank.dash_cooldown < 0.0
                 {
+                    tank.dash_cooldown = Tank::DEFAULT_DASH_COOLDOWN;
                     tank.speed = Tank::DASH_SPEED;
                 }
 
@@ -179,19 +231,20 @@ fn update(
                 let right_stick_y = axes
                     .get(GamepadAxis::new(gamepad, GamepadAxisType::RightStickY))
                     .unwrap();
-                if right_stick_x.abs() > 0.1 {
+                if f32::max(right_stick_x.abs(), right_stick_y.abs()) > 0.1 {
                     tank.facing.x = right_stick_x;
-                }
-                if right_stick_y.abs() > 0.1 {
                     tank.facing.y = right_stick_y;
                 }
                 tank.facing = tank.facing.normalize();
                 let right_stick_angle = f32::atan2(tank.facing.y, tank.facing.x);
                 transform.rotation = Quat::from_rotation_z(right_stick_angle);
 
-                if button_inputs
-                    .just_pressed(GamepadButton::new(gamepad, GamepadButtonType::RightTrigger))
+                if button_inputs.pressed(GamepadButton::new(
+                    gamepad,
+                    GamepadButtonType::RightTrigger2,
+                )) && tank.turret_cooldown < 0.0
                 {
+                    tank.turret_cooldown = Tank::DEFAULT_TURRET_COOLDOWN;
                     commands.spawn((
                         MaterialMesh2dBundle {
                             mesh: meshes.add(shape::RegularPolygon::new(10., 6).into()).into(),
@@ -204,9 +257,10 @@ fn update(
                             ..default()
                         },
                         RigidBody::Dynamic,
+                        Sensor,
                         Collider::ball(10.0),
                         Restitution::coefficient(0.7),
-                        Velocity::linear(1500.0 * tank.facing),
+                        Velocity::linear(1500.0 * tank.facing + velocity.linvel),
                         GravityScale(0.0),
                         Bullet { source: entity },
                     ));
@@ -222,34 +276,37 @@ fn handle_bullet_hit(
     rapier_context: Res<RapierContext>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut query_tank: Query<(Entity, &mut Tank)>,
+    mut query_tank: Query<(Entity, Option<&mut Tank>)>,
     query_bullet: Query<(Entity, &Bullet)>,
     mut commands: Commands,
 ) {
-    for (entity_tank, mut tank) in &mut query_tank {
-        for (entity_bullet, bullet) in &query_bullet {
-            if bullet.source == entity_tank {
+    for (entity_bullet, bullet) in &query_bullet {
+        for (entity_other, tank_opt) in &mut query_tank {
+            if bullet.source == entity_other {
                 continue;
             }
-            if rapier_context.intersection_pair(entity_tank, entity_bullet) == Some(true) {
+            if rapier_context.intersection_pair(entity_other, entity_bullet) == Some(true) {
                 commands.entity(entity_bullet).despawn();
-                tank.health -= 1;
-                let child = commands
-                    .spawn((
-                        MaterialMesh2dBundle {
-                            mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
-                            material: materials.add(ColorMaterial::from(Color::RED)),
-                            transform: Transform::from_translation(Vec3::new(
-                                0.,
-                                0.,
-                                ZOrder::HitEffect.into(),
-                            )),
-                            ..default()
-                        },
-                        FadeOut { t: 0.05 },
-                    ))
-                    .id();
-                commands.entity(entity_tank).add_child(child);
+
+                if let Some(mut tank) = tank_opt {
+                    tank.health -= 1;
+                    let child = commands
+                        .spawn((
+                            MaterialMesh2dBundle {
+                                mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
+                                material: materials.add(ColorMaterial::from(Color::RED)),
+                                transform: Transform::from_translation(Vec3::new(
+                                    0.,
+                                    0.,
+                                    ZOrder::HitEffect.into(),
+                                )),
+                                ..default()
+                            },
+                            FadeOut { t: 0.05 },
+                        ))
+                        .id();
+                    commands.entity(entity_other).add_child(child);
+                }
             }
         }
     }
