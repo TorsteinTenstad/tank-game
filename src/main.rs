@@ -9,17 +9,20 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
-        .add_plugins(RapierDebugRenderPlugin::default())
+        //.add_plugins(RapierDebugRenderPlugin::default())
         .add_systems(Startup, startup)
         .add_systems(Update, controller_setup)
         .add_systems(Update, update)
+        .add_systems(PostUpdate, handle_bullet_hit)
+        .add_systems(PostUpdate, fade_out)
         .run();
 }
 
 enum ZOrder {
-    PLAYER,
-    TURRET,
-    BULLET,
+    Bullet,
+    Player,
+    HitEffect,
+    Turret,
 }
 impl From<ZOrder> for f32 {
     fn from(value: ZOrder) -> Self {
@@ -28,8 +31,19 @@ impl From<ZOrder> for f32 {
 }
 
 #[derive(Component)]
+struct Bullet {
+    source: Entity,
+}
+
+#[derive(Component)]
+struct FadeOut {
+    t: f32,
+}
+
+#[derive(Component)]
 struct Tank {
     id: usize,
+    health: i32,
     speed: f32,
     facing: Vec2,
 }
@@ -37,6 +51,15 @@ impl Tank {
     const DEFAULT_SPEED: f32 = 500.0;
     const DASH_SPEED: f32 = 2000.0;
     const SPEED_FALLOFF: f32 = (Tank::DASH_SPEED - Tank::DEFAULT_SPEED) / 0.2;
+
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            health: 3,
+            speed: Tank::DEFAULT_SPEED,
+            facing: Vec2::new(1.0, 0.0),
+        }
+    }
 }
 
 fn controller_setup(gamepads: Res<Gamepads>, mut settings: ResMut<GamepadSettings>) {
@@ -82,44 +105,57 @@ fn startup(
 ) {
     commands.spawn(Camera2dBundle::default());
 
-    commands
-        .spawn((
-            MaterialMesh2dBundle {
-                mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
-                material: materials.add(ColorMaterial::from(Color::TURQUOISE)),
-                transform: Transform::from_translation(Vec3::new(150., 0., ZOrder::PLAYER.into())),
-                ..default()
-            },
-            Tank {
-                id: 0,
-                speed: 0.0,
-                facing: Vec2::new(0.0, 1.0),
-            },
-        ))
-        .with_children(|builder| {
-            builder.spawn(SpriteBundle {
-                sprite: Sprite {
-                    color: Color::WHITE,
-                    custom_size: Some(Vec2::new(70.0, 20.0)),
+    for id in 0..2 {
+        commands
+            .spawn((
+                RigidBody::KinematicPositionBased,
+                ActiveEvents::COLLISION_EVENTS,
+                Sensor,
+                Collider::ball(50.0),
+                MaterialMesh2dBundle {
+                    mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
+                    material: materials.add(ColorMaterial::from(Color::TURQUOISE)),
+                    transform: Transform::from_translation(Vec3::new(
+                        150.,
+                        0.,
+                        ZOrder::Player.into(),
+                    )),
                     ..default()
                 },
-                transform: Transform::from_translation(Vec3::new(35., 0., ZOrder::TURRET.into())),
-                ..default()
+                Tank::new(id),
+            ))
+            .with_children(|builder| {
+                builder.spawn(SpriteBundle {
+                    sprite: Sprite {
+                        color: Color::WHITE,
+                        custom_size: Some(Vec2::new(70.0, 20.0)),
+                        ..default()
+                    },
+                    transform: Transform::from_translation(Vec3::new(
+                        35.,
+                        0.,
+                        ZOrder::Turret.into(),
+                    )),
+                    ..default()
+                });
             });
-        });
+    }
 }
 
 fn update(
     time: Res<Time>,
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     gamepads: Res<Gamepads>,
     button_inputs: Res<Input<GamepadButton>>,
     axes: Res<Axis<GamepadAxis>>,
-    mut query: Query<(&mut Tank, &mut Transform)>,
+    mut query: Query<(Entity, &mut Tank, &mut Transform)>,
 ) {
-    for (mut tank, mut transform) in &mut query {
+    for (entity, mut tank, mut transform) in &mut query {
         tank.speed = (tank.speed - Tank::SPEED_FALLOFF * time.delta_seconds())
             .clamp(Tank::DEFAULT_SPEED, Tank::DASH_SPEED);
+
         match gamepads.iter().find(|&x| x.id == tank.id) {
             Some(gamepad) => {
                 transform.translation.x += tank.speed
@@ -143,34 +179,87 @@ fn update(
                 let right_stick_y = axes
                     .get(GamepadAxis::new(gamepad, GamepadAxisType::RightStickY))
                     .unwrap();
-                let right_stick_angle = f32::atan2(right_stick_y, right_stick_x);
-                if f32::max(right_stick_x.abs(), right_stick_y.abs()) > 0.1 {
-                    tank.facing = Vec2::new(right_stick_x, right_stick_y).normalize();
-                    transform.rotation = Quat::from_rotation_z(right_stick_angle);
+                if right_stick_x.abs() > 0.1 {
+                    tank.facing.x = right_stick_x;
                 }
+                if right_stick_y.abs() > 0.1 {
+                    tank.facing.y = right_stick_y;
+                }
+                tank.facing = tank.facing.normalize();
+                let right_stick_angle = f32::atan2(tank.facing.y, tank.facing.x);
+                transform.rotation = Quat::from_rotation_z(right_stick_angle);
 
                 if button_inputs
                     .just_pressed(GamepadButton::new(gamepad, GamepadButtonType::RightTrigger))
                 {
                     commands.spawn((
+                        MaterialMesh2dBundle {
+                            mesh: meshes.add(shape::RegularPolygon::new(10., 6).into()).into(),
+                            material: materials.add(ColorMaterial::from(Color::RED)),
+                            transform: Transform::from_xyz(
+                                transform.translation.x,
+                                transform.translation.y,
+                                ZOrder::Bullet.into(),
+                            ),
+                            ..default()
+                        },
                         RigidBody::Dynamic,
                         Collider::ball(10.0),
                         Restitution::coefficient(0.7),
-                        Velocity::linear(1000.0 * tank.facing),
+                        Velocity::linear(1500.0 * tank.facing),
                         GravityScale(0.0),
-                        TransformBundle::from(Transform::from_xyz(
-                            transform.translation.x,
-                            transform.translation.y,
-                            ZOrder::BULLET.into(),
-                        )),
+                        Bullet { source: entity },
                     ));
                 }
             }
 
-            None => warn!(
-                "No corresponding gamepad found for tank with id {:?}",
-                tank.id
-            ),
+            None => (), //warn!("No corresponding gamepad found for tank with id {:?}", tank.id),
+        }
+    }
+}
+
+fn handle_bullet_hit(
+    rapier_context: Res<RapierContext>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut query_tank: Query<(Entity, &mut Tank)>,
+    query_bullet: Query<(Entity, &Bullet)>,
+    mut commands: Commands,
+) {
+    for (entity_tank, mut tank) in &mut query_tank {
+        for (entity_bullet, bullet) in &query_bullet {
+            if bullet.source == entity_tank {
+                continue;
+            }
+            if rapier_context.intersection_pair(entity_tank, entity_bullet) == Some(true) {
+                commands.entity(entity_bullet).despawn();
+                tank.health -= 1;
+                let child = commands
+                    .spawn((
+                        MaterialMesh2dBundle {
+                            mesh: meshes.add(shape::RegularPolygon::new(50., 6).into()).into(),
+                            material: materials.add(ColorMaterial::from(Color::RED)),
+                            transform: Transform::from_translation(Vec3::new(
+                                0.,
+                                0.,
+                                ZOrder::HitEffect.into(),
+                            )),
+                            ..default()
+                        },
+                        FadeOut { t: 0.05 },
+                    ))
+                    .id();
+                commands.entity(entity_tank).add_child(child);
+            }
+        }
+    }
+}
+
+fn fade_out(time: Res<Time>, mut commands: Commands, mut query: Query<(Entity, &mut FadeOut)>) {
+    for (entity, mut fade_out) in &mut query {
+        fade_out.t -= time.delta_seconds();
+        if fade_out.t < 0.0 {
+            commands.entity(entity).despawn();
         }
     }
 }
